@@ -14,6 +14,10 @@ import unittest
 WRAPPER = Path(__file__).resolve().parents[1] / "src" / "floorp.sh"
 BINARY_PATH = "/app/lib/floorp/floorp"
 NATIVE_BINARY = os.environ.get("FLOORP_TEST_BINARY")
+INFORMATION_FLAGS = (
+    "-v", "--v", "-version", "--version", "-full-version", "--full-version",
+    "-h", "--h", "-help", "--help", "-?", "--?", "--VERSION", "--help=ignored",
+)
 
 
 class LauncherFixture(unittest.TestCase):
@@ -101,8 +105,31 @@ class LauncherFixture(unittest.TestCase):
     def assert_root(self, output, root):
         self.assertEqual(output["env"]["MOZ_APP_DATA"], str(root))
 
+    def absolute_database(self, root, profile):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "profiles.ini").write_text(
+            "[General]\nStartWithLastProfile=1\nVersion=2\n\n"
+            "[Profile0]\nName=absolute-daily\nIsRelative=0\nPath=" + str(profile) + "\n"
+        )
+
 
 class WrapperTests(LauncherFixture):
+    def test_information_flags_do_not_read_or_record_profile_state(self):
+        for state in ("fresh", "ambiguous", "invalid-record"):
+            if state == "ambiguous":
+                self.database(self.legacy, "legacy")
+                self.database(self.xdg, "xdg")
+                self.database(self.home / ".floorp", "host")
+            elif state == "invalid-record":
+                self.record.write_text("invalid-relative-path\n")
+            before = self.snapshot(self.app)
+            for flag in INFORMATION_FLAGS:
+                with self.subTest(state=state, flag=flag):
+                    result = self.launch(flag)
+                    self.assertEqual(result["args"], ["--name", "one.ablaze.floorp", flag])
+                    self.assertIsNone(result["env"]["MOZ_APP_DATA"])
+                    self.assertEqual(self.snapshot(self.app), before)
+
     def test_fresh_and_empty_persist_marker_use_xdg(self):
         self.persist_visible()
         (self.legacy / "profiles.ini").touch()
@@ -276,6 +303,98 @@ class WrapperTests(LauncherFixture):
         self.assertEqual(self.record.read_text(), str(self.xdg) + "\n")
         self.assertEqual(list(self.config.glob("floorp-profile-root.*")), [])
 
+    def test_absolute_alias_is_checked_before_recording_and_after_home_toggle(self):
+        alias = self.home / ".floorp"
+        self.absolute_database(self.legacy, alias / "absolute-daily")
+        alias.mkdir()
+        before = self.snapshot(self.app)
+        error = self.launch("-P", "absolute-daily", succeeds=False)
+        self.assertIn("Stored absolute profile path", error.stderr)
+        self.assertIn(str(self.legacy / "absolute-daily"), error.stderr)
+        self.assertIn("MOZ_APP_DATA alone", error.stderr)
+        self.assertEqual(self.snapshot(self.app), before)
+        self.assertFalse(self.record.exists())
+
+        alias.rmdir()
+        self.persist_visible()
+        self.assert_root(self.launch(), self.legacy)
+        saved = self.record.read_bytes()
+        alias.unlink()
+        alias.mkdir()
+        for arguments in ((), ("-P", "absolute-daily")):
+            self.launch(*arguments, succeeds=False)
+        self.launch(overrides={"MOZ_APP_DATA": str(self.legacy)}, succeeds=False)
+        self.assertEqual(self.record.read_bytes(), saved)
+        alias.rmdir()
+        self.persist_visible()
+        self.assert_root(self.launch("-P", "absolute-daily"), self.legacy)
+
+    def test_alias_fields_accept_order_whitespace_comments_and_unterminated_lines(self):
+        self.legacy.mkdir(parents=True)
+        alias_path = str(self.home / ".floorp" / "daily=value")
+        cases = (
+            "[Profile0]\nPath=" + alias_path + "\nName=daily\nIsRelative=0",
+            "  [Profile0]  \r\n\tPath = " + alias_path + "\t\r\n; comment\r\nIsRelative = 0 \r\n",
+            "[Profile0]\nIsRelative=0\n# comment\nPath=" + alias_path + "\n[Profile1]\nIsRelative=1\nPath=other\n",
+        )
+        for metadata in cases:
+            with self.subTest(metadata=metadata):
+                (self.legacy / "profiles.ini").write_text(metadata)
+                before = self.snapshot(self.legacy)
+                self.launch(succeeds=False)
+                self.assertEqual(self.snapshot(self.legacy), before)
+                self.assertFalse(self.record.exists())
+
+    def test_install_defaults_and_backup_alias_references_are_checked(self):
+        self.legacy.mkdir(parents=True)
+        alias_path = str(self.home / ".floorp" / "daily")
+        cases = (
+            ("profiles.ini", "[Profile0]\nIsRelative=1\nPath=daily\n[InstallCURRENT]\nDefault=" + alias_path + "\n"),
+            ("profiles.ini", " [InstallCURRENT] \r\nLocked=1\r\n Default = " + alias_path + " \r\n"),
+            ("installs.ini", "[OLDINSTALL]\nLocked=1\nDefault=" + alias_path),
+        )
+        for filename, metadata in cases:
+            with self.subTest(filename=filename, metadata=metadata):
+                for existing in self.legacy.glob("*.ini"):
+                    existing.unlink()
+                (self.legacy / filename).write_text(metadata)
+                before = self.snapshot(self.legacy)
+                self.launch(succeeds=False)
+                self.assertEqual(self.snapshot(self.legacy), before)
+                self.assertFalse(self.record.exists())
+
+    def test_stable_absolute_paths_and_alias_prefix_boundary_remain_supported(self):
+        for profile in (self.root / "stable-profile", self.home / ".floorp-other" / "daily"):
+            with self.subTest(profile=profile):
+                self.absolute_database(self.legacy, profile)
+                (self.legacy / "installs.ini").write_text("[EXISTING]\nDefault=" + str(profile) + "\n")
+                before = self.snapshot(self.legacy)
+                self.assert_root(self.launch(), self.legacy)
+                self.assertEqual(self.snapshot(self.legacy), before)
+
+    def test_database_override_is_guarded_but_direct_profile_is_authoritative(self):
+        custom = self.app / "custom-database"
+        self.absolute_database(custom, self.home / ".floorp" / "daily")
+        before = self.snapshot(custom)
+        overrides = {"MOZ_APP_DATA": str(custom)}
+        self.launch("-P", "absolute-daily", overrides=overrides, succeeds=False)
+        self.assertFalse(self.record.exists())
+        selected = self.legacy / "daily"
+        for arguments in (("-profile", str(selected)), ("--profile=" + str(selected),)):
+            result = self.launch(*arguments, overrides=overrides)
+            self.assert_root(result, custom)
+            self.assertEqual(result["args"], ["--name", "one.ablaze.floorp", *arguments])
+        self.launch(overrides=overrides | {"XRE_PROFILE_PATH": str(selected)})
+        self.assertEqual(self.snapshot(custom), before)
+
+    def test_unrelated_defaults_and_relative_profiles_do_not_trigger_alias_guard(self):
+        self.legacy.mkdir(parents=True)
+        (self.legacy / "profiles.ini").write_text(
+            "[General]\nDefault=" + str(self.home / ".floorp" / "unused") + "\n"
+            "[Profile0]\nIsRelative=1\nPath=daily\nDefault=1\n"
+        )
+        self.assert_root(self.launch(), self.legacy)
+
 
 @unittest.skipUnless(NATIVE_BINARY, "set FLOORP_TEST_BINARY to test a native Floorp build")
 class NativeTests(LauncherFixture):
@@ -292,8 +411,9 @@ class NativeTests(LauncherFixture):
         (self.app / "cache" / "tmp").mkdir(parents=True)
         self.launch_number = 0
 
-    def native(self, *arguments, seed_root=None, unwrapped=False):
-        environment = dict(self.environment)
+    def native(self, *arguments, seed_root=None, unwrapped=False, overrides=None,
+               expected_returncode=0):
+        environment = self.environment | (overrides or {})
         if seed_root is not None:
             environment["MOZ_APP_DATA"] = str(seed_root)
             environment["MOZ_LOCAL_APP_DATA"] = str(self.app / "cache" / "floorp")
@@ -316,7 +436,8 @@ class NativeTests(LauncherFixture):
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait(timeout=2)
                 self.fail("Native fixture timed out; only its own process group was terminated.")
-        self.assertEqual(returncode, 0, f"See native logs in {self.root}")
+        self.assertEqual(returncode, expected_returncode, f"See native logs in {self.root}")
+        return self.root / f"launch-{self.launch_number}.stderr"
 
     def names(self, root):
         database = configparser.ConfigParser()
@@ -390,6 +511,94 @@ class NativeTests(LauncherFixture):
         self.assertFalse(self.record.exists())
         self.assertEqual((self.snapshot(self.legacy), self.snapshot(self.xdg),
                           self.snapshot(self.home / ".floorp")), before)
+
+    def test_native_information_flags_leave_database_state_unchanged(self):
+        for state in ("fresh", "ambiguous", "invalid-record"):
+            if state == "ambiguous":
+                self.database(self.legacy, "legacy")
+                self.database(self.xdg, "xdg")
+                self.database(self.home / ".floorp", "host")
+            elif state == "invalid-record":
+                self.record.write_text("invalid-relative-path\n")
+            metadata = {str(path): path.read_bytes() for path in self.app.rglob("*.ini")}
+            saved = self.record.read_bytes() if self.record.exists() else None
+            for flag in ("-v", "--version", "--full-version", "-h", "--help", "--help=ignored"):
+                with self.subTest(state=state, flag=flag):
+                    self.native(flag)
+                    stdout = self.root / f"launch-{self.launch_number}.stdout"
+                    self.assertTrue(stdout.read_text().strip())
+                    self.assertEqual({str(path): path.read_bytes() for path in self.app.rglob("*.ini")}, metadata)
+                    self.assertEqual(self.record.read_bytes() if self.record.exists() else None, saved)
+
+    def test_native_absolute_alias_is_blocked_before_host_profile_is_used(self):
+        self.persist_visible()
+        self.native("--screenshot", str(self.root / "initial.png"), "about:blank", unwrapped=True)
+        database = configparser.ConfigParser()
+        database.optionxform = str
+        database.read(self.legacy / "profiles.ini")
+        install = next(section for section in database.sections() if section.startswith("Install"))
+        leaf = database[install]["Default"]
+        profile_section = next(section for section in database.sections()
+                               if section.startswith("Profile") and database[section]["Path"] == leaf)
+        alias_profile = self.home / ".floorp" / leaf
+        private_profile = self.legacy / leaf
+        database[profile_section]["Name"] = "absolute-daily"
+        database[profile_section]["IsRelative"] = "0"
+        database[profile_section]["Path"] = str(alias_profile)
+        database[install]["Default"] = str(alias_profile)
+        with (self.legacy / "profiles.ini").open("w") as stream:
+            database.write(stream, space_around_delimiters=False)
+        (self.legacy / "installs.ini").write_text(
+            "[" + install.removeprefix("Install") + "]\nDefault=" + str(alias_profile) + "\nLocked=1\n"
+        )
+        (private_profile / "user.js").write_text('user_pref("fixture.profile_identity", "private-absolute");\n')
+        self.native("-P", "absolute-daily", "--screenshot", str(self.root / "private.png"), "about:blank")
+        self.assertIn('"private-absolute"', (private_profile / "prefs.js").read_text())
+        metadata = {name: (self.legacy / name).read_bytes() for name in ("profiles.ini", "installs.ini")}
+        saved = self.record.read_bytes()
+
+        (self.home / ".floorp").unlink()
+        alias_profile.mkdir(parents=True)
+        (alias_profile / "user.js").write_text('user_pref("fixture.profile_identity", "host-absolute");\n')
+        host_before = self.snapshot(self.home / ".floorp")
+        for arguments, overrides in (
+            ((), None), (("-P", "absolute-daily"), None),
+            (("-P", "absolute-daily"), {"MOZ_APP_DATA": str(self.legacy)}),
+        ):
+            error = self.native(*arguments, overrides=overrides, expected_returncode=1)
+            self.assertIn("Stored absolute profile path", error.read_text())
+            self.assertIn(str(private_profile), error.read_text())
+            self.assertEqual(self.snapshot(self.home / ".floorp"), host_before)
+            self.assertEqual({name: (self.legacy / name).read_bytes() for name in metadata}, metadata)
+            self.assertEqual(self.record.read_bytes(), saved)
+
+        # Negative control: the same native binary without the guard selects
+        # the host backing from the absolute Path despite fixed MOZ_APP_DATA.
+        self.native("-P", "absolute-daily", "--screenshot", str(self.root / "unguarded-host.png"),
+                    "about:blank", seed_root=self.legacy, unwrapped=True)
+        self.assertIn('"host-absolute"', (alias_profile / "prefs.js").read_text())
+        host_after_control = self.snapshot(self.home / ".floorp")
+        self.native("--profile=" + str(private_profile), "--screenshot",
+                    str(self.root / "explicit-private.png"), "about:blank")
+        self.assertIn('"private-absolute"', (private_profile / "prefs.js").read_text())
+        self.assertEqual(self.snapshot(self.home / ".floorp"), host_after_control)
+        (self.home / ".floorp").rename(self.root / "host-saved")
+        self.persist_visible()
+        self.native("-P", "absolute-daily", "--screenshot", str(self.root / "restored-private.png"), "about:blank")
+        self.assertIn('"private-absolute"', (private_profile / "prefs.js").read_text())
+
+    def test_native_stable_absolute_custom_profile_remains_supported(self):
+        custom_profile = self.app / "custom-profiles" / "daily"
+        self.native("--createprofile", "stable-daily " + str(custom_profile), seed_root=self.legacy)
+        (custom_profile / "user.js").write_text('user_pref("fixture.profile_identity", "stable-custom");\n')
+        self.persist_visible()
+        self.native("-P", "stable-daily", "--screenshot", str(self.root / "persist-stable.png"), "about:blank")
+        (self.home / ".floorp").unlink()
+        self.database(self.home / ".floorp", "host")
+        host_before = self.snapshot(self.home / ".floorp")
+        self.native("-P", "stable-daily", "--screenshot", str(self.root / "home-stable.png"), "about:blank")
+        self.assertIn('"stable-custom"', (custom_profile / "prefs.js").read_text())
+        self.assertEqual(self.snapshot(self.home / ".floorp"), host_before)
 
 
 if __name__ == "__main__":

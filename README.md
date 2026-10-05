@@ -26,9 +26,11 @@ flatpak-builder --run build-dir one.ablaze.floorp.yml floorp
 
 ## Profile location
 
-The launcher keeps the profile database in the app's private storage so adding
-or removing `--filesystem=home` does not select a different profile. It keeps an
-existing database in `~/.var/app/one.ablaze.floorp/.floorp` or
+The launcher's default database locations are in the app's private storage instead
+of a home path whose backing changes with `--filesystem=home`. Relative
+profile entries continue to select the same profile; absolute entries need the
+check described below. It keeps an existing database in
+`~/.var/app/one.ablaze.floorp/.floorp` or
 `~/.var/app/one.ablaze.floorp/config/floorp` without moving profiles or rewriting
 `profiles.ini` / `installs.ini`. New installations use the config location.
 Absolute `XDG_CONFIG_HOME` and `XDG_CACHE_HOME` values are supported; unset or
@@ -47,9 +49,31 @@ location when the current native selection can be determined: the home path is
 the private legacy backing, or no home legacy path exists and native Floorp uses
 XDG. If a separate host `.floorp` path or a forced legacy setting makes this
 ambiguous, it stops and asks for an explicit `MOZ_APP_DATA` or `-profile` choice.
-Host profiles are never adopted automatically. An invalid saved record also
-requires an explicit choice; a direct `-profile` launch remains available.
+The host `.floorp` directory is not a default database candidate. An invalid
+saved record also requires an explicit choice; a direct `-profile` launch remains
+available.
 No profile data is deleted, migrated, or merged by the launcher.
+
+Before an ordinary or `-P` launch, the selected database is checked for absolute
+profile Paths or install Defaults that reference `HOME/.floorp`. This includes
+`profiles.ini`, the `installs.ini` backup, saved database locations, and explicit
+`MOZ_APP_DATA` overrides. If the home path is the private legacy backing, these
+entries are safe to use. If it refers to a different backing or is unavailable,
+the launcher stops before starting Floorp. It does not rewrite the metadata.
+The check is conservative: any stored alias reference can stop a launch,
+including a currently unused profile or an older backup mapping.
+
+Use `-profile /full/private/path/to/profile` to select that profile directly,
+for example a profile directory under
+`~/.var/app/one.ablaze.floorp/.floorp`. `MOZ_APP_DATA` alone only chooses the
+database and cannot change an absolute profile Path stored in it. Stable absolute
+custom paths remain supported, and similarly named paths such as `.floorp-other`
+do not trigger this check. Direct `-profile` (including `--profile=/full/path`)
+and restart `XRE_PROFILE_PATH` selections remain authoritative.
+
+Native help and version flags (`h`, `help`, `?`, `v`, `version`, `full-version`)
+are forwarded before database selection. They work even with ambiguous databases
+or a malformed saved location and do not create a database-location record.
 
 ## Launcher tests
 
